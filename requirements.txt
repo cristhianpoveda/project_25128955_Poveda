@@ -1,0 +1,10 @@
+numpy
+opencv-python
+matplotlib
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # Check cuda version
+tqdm
+pyyaml
+motmetrics
+torchinfo
+torchviz
+graphviz
