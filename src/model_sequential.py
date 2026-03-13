@@ -5,6 +5,12 @@ import torch.nn.functional as F
 class DoubleConv(nn.Module):
     
     def __init__(self, in_channels, out_channels):
+        """
+        Double convolution + batch normalisation + ReLU
+        Args:
+            in_channels: number of input channels
+            out_channels: number of output channels
+        """
         super().__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
@@ -21,23 +27,25 @@ class DoubleConv(nn.Module):
 class HandGestureModel(nn.Module):
     def __init__(self, in_channels=3, n_classes=10):
         """
+        PROPOSED PARALLEL U-NET ARCHITECTURE
         Args:
             in_channels (int): 3 for RGB, 4 for RGB-D.
             n_classes (int): Number of gesture classes (10).
         """
         super(HandGestureModel, self).__init__()
         
-        # FLEXIBLE INPUT
+        # 3 or 4-channel input
         self.inc = DoubleConv(in_channels, 64)
 
-        # ENCODER
+        # Encoder
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
         
+        # Semantic features map
         self.bottleneck = DoubleConv(512, 1024)
 
-        # SEGMENTATION HEAD
+        # Decoder (Segmentation)
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.conv_up1 = DoubleConv(1024 + 512, 512)
         
@@ -53,7 +61,7 @@ class HandGestureModel(nn.Module):
         # Final Prediction
         self.seg_out = nn.Conv2d(64, 1, kernel_size=1) 
 
-        # CLASSIFICATION HEAD
+        # Classification block
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.class_head = nn.Sequential(
             nn.Flatten(),
@@ -64,7 +72,16 @@ class HandGestureModel(nn.Module):
         )
 
     def forward(self, x):
-        # x shape: [Batch, in_channels, H, W]
+
+        """
+        NEURAL NETWORK FORWARD PASS
+        Args:
+            x: input tensor
+
+        Returns:
+            mask_logits: hand mask logits
+            clas_logits: Hand gesture class logits
+        """
         
         # Encoder
         x1 = self.inc(x)        # [B, 64, H, W]
@@ -93,10 +110,8 @@ class HandGestureModel(nn.Module):
         mask_logits = self.seg_out(x) # [B, 1, H, W]
 
         mask_probs = torch.sigmoid(mask_logits)
-        
-        #masked_features = x * mask_probs
 
-        attended_features = x * (1.0 + mask_probs) 
+        attended_features = x * (1.0 + mask_probs)  # Attention gate
 
         # Classify on the mask
         class_logits = self.class_head(self.global_pool(attended_features))
@@ -104,11 +119,15 @@ class HandGestureModel(nn.Module):
         return mask_logits, class_logits
 
 if __name__ == "__main__":
-    
+
+    # Handling 3 channels
+        
     model_rgb = HandGestureModel(in_channels=3)
     out_mask, out_class = model_rgb(torch.randn(1, 3, 256, 256))
     print(f"RGB Input -> Mask: {out_mask.shape}, Class: {out_class.shape}")
 
+    # Handling 4 channels
+    
     model_rgbd = HandGestureModel(in_channels=4)
     out_mask, out_class = model_rgbd(torch.randn(1, 4, 256, 256))
     print(f"RGB-D Input -> Mask: {out_mask.shape}, Class: {out_class.shape}")

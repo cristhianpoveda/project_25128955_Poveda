@@ -15,14 +15,12 @@ import seaborn as sns
 from sklearn.metrics import f1_score, confusion_matrix
 import torch.backends.cudnn as cudnn
 
-# Custom Imports
-from src.model_sequential import HandGestureModel
-from src.dataloader_augmentation import HandGestureDataset
+from src.model import HandGestureModel # Model architecture 
+from src.dataloader_augmentation import HandGestureDataset # Custom dataloader for the dataset
 from src.utils import load_depth_map
 
-# --- CONFIGURATION ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-WEIGHTS_DIR = "weights"
+WEIGHTS_DIR = "weights/fine"
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -34,7 +32,16 @@ IDX_TO_CLASS = {v: k for k, v in CLASS_MAP.items()}
 CLASSES = [IDX_TO_CLASS[i] for i in range(10)]
 
 def get_student_split(root_dir):
-    """Replicates train.py logic to get exact Train and Val students."""
+    """
+    Replicates train_validation.py logic to get exact Train and Val students
+    Args:
+        root_dir: Dataset root directory
+
+    Returns:
+        train_students: List of students for the training set
+        val_students: List of students for the validation set
+        test_students: List of students for the test set
+    """
     students = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)) and not d.startswith('.')]
     students.sort()
     n_total = len(students)
@@ -47,7 +54,10 @@ def get_student_split(root_dir):
     return train_students, val_students, test_students
 
 class OfficialTestDataset(Dataset):
-    """Custom Dataset for the Official Test Set structure."""
+    """
+    Custom Dataset for the test set structure
+
+    """
     def __init__(self, root_dir):
         self.samples = []
         root = Path(root_dir)
@@ -70,6 +80,7 @@ class OfficialTestDataset(Dataset):
     def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
+
         sample = self.samples[idx]
         rgb_img = Image.open(sample['rgb']).convert('RGB')
         mask_img = Image.open(sample['mask']).convert('L')
@@ -86,9 +97,13 @@ class OfficialTestDataset(Dataset):
             'label': torch.tensor(sample['label'], dtype=torch.long)
         }
 
-# SEGMENTATION AND DETECTION UTILS
+# Segmentation and detection utils
 def keep_largest_connected_component(binary_masks):
-    """Filters a batch of binary masks to keep only the largest blob per image."""
+    """
+    Filters a batch of binary masks to keep only the largest blob per image
+    Args:
+        binary_masks: Predicted  segmentation mask
+    """
     cleaned_masks = []
     masks_cpu = binary_masks.cpu()
     
@@ -97,23 +112,29 @@ def keep_largest_connected_component(binary_masks):
         
         # Calculate Connected Components
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
-        
-        # If it's completely black, just return zeros
         if num_labels <= 1:
             cleaned_masks.append(torch.zeros_like(mask))
             continue
             
-        # Find the largest component (ignoring background ID 0)
+        # Find the largest component (ignores ID 0: background)
         largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         
-        # Create a new mask keeping ONLY the largest label
+        # Create a new mask from the largest label
         cleaned_mask_np = (labels == largest_label).astype(np.float32)
         cleaned_masks.append(torch.from_numpy(cleaned_mask_np).unsqueeze(0))
         
-    # Push back to GPU
+    # Push new mask back to GPU
     return torch.stack(cleaned_masks).to(binary_masks.device)
 
 def extract_bboxes_from_masks(masks):
+    """
+    COMPUTE MINIMUM BOUNDING BOX OF A BINARY MASK
+    Args:
+        masks: predicted mask
+        
+    Returns:
+        bounding_boxes
+    """
     boxes = []
     masks_cpu = masks.cpu() 
     
@@ -124,11 +145,16 @@ def extract_bboxes_from_masks(masks):
         else:
             boxes.append(torch.tensor([torch.min(pos[1]), torch.min(pos[0]), torch.max(pos[1]), torch.max(pos[0])]))
             
-    # 2. Push the final batch of boxes back to the GPU at once
+    # Push the final batch of boxes back to the GPU at once
     return torch.stack(boxes).float().to(masks.device)
 
 def calculate_bbox_iou(pred_boxes, true_boxes):
-    """Calculates IoU between predicted and ground truth bounding boxes."""
+    """
+    Calculates IoU between predicted and ground truth bounding boxes
+    Args:
+        pred_boxes: predicted bounding boxes
+        true_boxes: ground truth bounding boxes
+        """
     x1 = torch.max(pred_boxes[:, 0], true_boxes[:, 0])
     y1 = torch.max(pred_boxes[:, 1], true_boxes[:, 1])
     x2 = torch.min(pred_boxes[:, 2], true_boxes[:, 2])
@@ -141,14 +167,24 @@ def calculate_bbox_iou(pred_boxes, true_boxes):
     union_area = pred_area + true_area - inter_area
     iou = inter_area / (union_area + 1e-6)
     
-    # Handle completely empty predictions/ground truths safely
+    # Handle completely empty boundin boxes safely
     empty_mask = (pred_area == 0) & (true_area == 0)
     iou[empty_mask] = 0.0 
     return iou
 
 def calculate_mask_metrics(pred_binary, true_mask, smooth=1e-6):
-    """Calculates Mask IoU and Dice Coefficient per batch."""
-    #pred_mask_logits = (torch.sigmoid(pred_mask_logits) > 0.5).float()
+    """
+    Calculates Mask IoU and Dice Coefficient per batch
+    Args:
+        pred_binary: predicted mask
+        true_mask: ground truth mask
+        smooth: mask smoothing factor
+
+    Returns:
+        iou: Intersection over union
+        dice: Dice score
+        pred_binary: predicted mask
+    """
     pred_flat, true_flat = pred_binary.view(pred_binary.size(0), -1), true_mask.view(true_mask.size(0), -1)
     
     intersection = (pred_flat * true_flat).sum(1)
@@ -159,18 +195,42 @@ def calculate_mask_metrics(pred_binary, true_mask, smooth=1e-6):
     return iou, dice, pred_binary
 
 def plot_confusion_matrix(y_true, y_pred, dataset_name):
+    """
+    PLOT CONFUSION MATRIX
+    
+    Args:
+        y_true: ground truth classification lables
+        y_pred: predicted classification lables
+        """
     cm = confusion_matrix(y_true, y_pred, labels=range(10))
     plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASSES, yticklabels=CLASSES)
-    plt.title(f'Confusion Matrix - {dataset_name.upper()}')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=CLASSES, yticklabels=CLASSES,
+                annot_kws={"size": 16})
+    plt.title(f'Confusion Matrix - {dataset_name.upper()}', fontsize=22, fontweight='bold')
+    plt.ylabel('True Label', fontsize=18, fontweight='bold')
+    plt.xlabel('Predicted Label', fontsize=18, fontweight='bold')
+    plt.xticks(fontsize=14, rotation=45)
+    plt.yticks(fontsize=14, rotation=0)
+    
     plt.tight_layout()
     plt.savefig(f"{RESULTS_DIR}/cm_{dataset_name}.png")
     plt.close()
 
 def plot_qualitative_overlays(rgb_batch, true_masks, pred_masks, true_boxes, pred_boxes, true_labels, pred_labels, dataset_name, num_samples=4):
-    """Plots RGB image with True and Predicted Masks & Bounding Boxes overlaid."""
+    """
+    Plots RGB image with True and Predicted Masks & Bounding Boxes overlaid
+    Args:
+        rgb_batch: images batch
+        true_masks: ground truth masks
+        pred_masks: predicted masks
+        pred_boxes: predicted bounding boxes
+        true_boxes: ground truth bounding boxes
+        y_true: ground truth classification lables
+        y_pred: predicted classification lables
+        dataset_name: Name of the dataset
+        num_samples: number of rows to stack with sample tests
+        """
     num_samples = min(num_samples, rgb_batch.size(0))
     fig, axs = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
     
@@ -179,37 +239,37 @@ def plot_qualitative_overlays(rgb_batch, true_masks, pred_masks, true_boxes, pre
         t_mask, p_mask = true_masks[i].squeeze().cpu().numpy(), pred_masks[i].squeeze().cpu().numpy()
         t_box, p_box = true_boxes[i].cpu().numpy(), pred_boxes[i].cpu().numpy()
         
-        # 1. RGB Image
+        # RGB Image
         axs[i, 0].imshow(img)
-        axs[i, 0].set_title(f"Input ({dataset_name})")
+        axs[i, 0].set_title(f"Input ({dataset_name})", fontsize=18, fontweight='bold')
         axs[i, 0].axis('off')
         
-        # 2. Ground Truth Overlay
+        # Ground truth overlay
         axs[i, 1].imshow(img)
         axs[i, 1].imshow(t_mask, cmap='Greens', alpha=0.4)
         if np.sum(t_box) > 0:
-            rect = patches.Rectangle((t_box[0], t_box[1]), t_box[2]-t_box[0], t_box[3]-t_box[1], linewidth=2, edgecolor='g', facecolor='none')
+            rect = patches.Rectangle((t_box[0], t_box[1]), t_box[2]-t_box[0], t_box[3]-t_box[1], linewidth=3, edgecolor='g', facecolor='none')
             axs[i, 1].add_patch(rect)
-        axs[i, 1].set_title(f"True: {IDX_TO_CLASS[true_labels[i].item()].upper()}")
+        axs[i, 1].set_title(f"True: {IDX_TO_CLASS[true_labels[i].item()].upper()}", fontsize=18, fontweight='bold')
         axs[i, 1].axis('off')
 
-        # 3. Prediction Overlay
+        # Prediction overlay
         color = 'Greens' if true_labels[i] == pred_labels[i] else 'Reds'
         box_color = 'g' if true_labels[i] == pred_labels[i] else 'r'
         
         axs[i, 2].imshow(img)
         axs[i, 2].imshow(p_mask, cmap=color, alpha=0.4)
         if np.sum(p_box) > 0:
-            rect = patches.Rectangle((p_box[0], p_box[1]), p_box[2]-p_box[0], p_box[3]-p_box[1], linewidth=2, edgecolor=box_color, facecolor='none')
+            rect = patches.Rectangle((p_box[0], p_box[1]), p_box[2]-p_box[0], p_box[3]-p_box[1], linewidth=3, edgecolor=box_color, facecolor='none')
             axs[i, 2].add_patch(rect)
-        axs[i, 2].set_title(f"Pred: {IDX_TO_CLASS[pred_labels[i].item()].upper()}")
+        axs[i, 2].set_title(f"Pred: {IDX_TO_CLASS[pred_labels[i].item()].upper()}", fontsize=18, fontweight='bold')
         axs[i, 2].axis('off')
 
     plt.tight_layout()
     plt.savefig(f"{RESULTS_DIR}/qualitative_{dataset_name}.png")
     plt.close()
 
-def evaluate_dataset(model, loader, channels, dataset_name):
+def evaluate_dataset(model, loader, channels, dataset_name, connected_components):
     model.eval()
     loop = tqdm(loader, desc=f"Evaluating {dataset_name.upper()}")
     
@@ -224,13 +284,9 @@ def evaluate_dataset(model, loader, channels, dataset_name):
     bbox_acc_05_count = 0
     total_samples = 0
     
-    # --- NEW: Trackers for diverse qualitative samples ---
-    qual_samples = {
-        'rgb': [], 'true_masks': [], 'pred_masks': [],
-        'true_boxes': [], 'pred_boxes': [], 'true_labels': [], 'pred_labels': []
-    }
-    plotted_classes = set()
-    target_qual_samples = 4 # The number of rows in your image
+    success_bucket = []
+    cls_fail_bucket = []
+    seg_fail_bucket = []
 
     with torch.no_grad():
         for i, batch in enumerate(loop):
@@ -238,25 +294,32 @@ def evaluate_dataset(model, loader, channels, dataset_name):
             masks, labels = batch['mask'].to(DEVICE).float(), batch['label'].to(DEVICE)
             images = torch.cat([rgb, depth], dim=1) if channels == 4 else rgb
 
-            # Forward
+            # Forward pass
             with torch.autocast(device_type=DEVICE):
                 mask_logits, class_logits = model(images)
             
-            # --- 1. Classification ---
+            # Classification
             _, predicted_classes = torch.max(class_logits, 1)
             all_true_labels.extend(labels.cpu().tolist())
             all_pred_labels.extend(predicted_classes.cpu().tolist())
             total_samples += labels.size(0)
 
             raw_pred_binary = (torch.sigmoid(mask_logits) > 0.5).float()
-            clean_pred_binary = keep_largest_connected_component(raw_pred_binary)
+            
+            if connected_components:
+                
+                clean_pred_binary = keep_largest_connected_component(raw_pred_binary)
 
-            # --- 2. Segmentation ---
+            else:
+
+                clean_pred_binary = raw_pred_binary
+
+            # Segmentation
             batch_mask_iou, batch_dice, pred_masks_binary = calculate_mask_metrics(clean_pred_binary, masks)
             total_mask_iou += batch_mask_iou.sum().item()
             total_dice += batch_dice.sum().item()
 
-            # --- 3. Detection (Bboxes) ---
+            # Detection (Bboxes)
             true_bboxes = extract_bboxes_from_masks(masks)
             pred_bboxes = extract_bboxes_from_masks(clean_pred_binary)
             
@@ -264,35 +327,57 @@ def evaluate_dataset(model, loader, channels, dataset_name):
             total_bbox_iou += batch_bbox_iou.sum().item()
             bbox_acc_05_count += (batch_bbox_iou > 0.5).sum().item()
 
-            # --- 4. NEW: Collect Diverse Qualitative Samples ---
             for b_idx in range(labels.size(0)):
-                lbl = labels[b_idx].item()
-                # If we haven't seen this gesture yet, and we still need more images, save it!
-                if lbl not in plotted_classes and len(plotted_classes) < target_qual_samples:
-                    plotted_classes.add(lbl)
-                    qual_samples['rgb'].append(rgb[b_idx].cpu())
-                    qual_samples['true_masks'].append(masks[b_idx].cpu())
-                    qual_samples['pred_masks'].append(pred_masks_binary[b_idx].cpu())
-                    qual_samples['true_boxes'].append(true_bboxes[b_idx].cpu())
-                    qual_samples['pred_boxes'].append(pred_bboxes[b_idx].cpu())
-                    qual_samples['true_labels'].append(labels[b_idx].cpu())
-                    qual_samples['pred_labels'].append(predicted_classes[b_idx].cpu())
+                lbl_true = labels[b_idx].item()
+                lbl_pred = predicted_classes[b_idx].item()
+                iou = batch_bbox_iou[b_idx].item()
 
-    # --- NEW: Plot the diverse samples after the loop finishes ---
-    if len(qual_samples['rgb']) > 0:
+                # Data loading
+
+                sample_dict = {
+                    'rgb': rgb[b_idx].cpu(),
+                    'true_masks': masks[b_idx].cpu(),
+                    'pred_masks': pred_masks_binary[b_idx].cpu(),
+                    'true_boxes': true_bboxes[b_idx].cpu(),
+                    'pred_boxes': pred_bboxes[b_idx].cpu(),
+                    'true_labels': labels[b_idx].cpu(),
+                    'pred_labels': predicted_classes[b_idx].cpu()
+                }
+
+                # Perfect Predictions (Need 2)
+                if lbl_true == lbl_pred and iou > 0.85 and len(success_bucket) < 2:
+                    # Random gesture !=
+                    if lbl_true not in [s['true_labels'].item() for s in success_bucket]:
+                        success_bucket.append(sample_dict)
+
+                # Classification Failure
+                elif lbl_true != lbl_pred and len(cls_fail_bucket) < 1:
+                    cls_fail_bucket.append(sample_dict)
+
+                # Segmentation Failure
+                elif lbl_true == lbl_pred and iou < 0.4 and len(seg_fail_bucket) < 1:
+                    seg_fail_bucket.append(sample_dict)
+
+    final_samples = success_bucket + cls_fail_bucket + seg_fail_bucket
+    
+    # If perfect samples are chosen
+    while len(final_samples) < 4 and len(success_bucket) > 0:
+        final_samples.append(success_bucket[0])
+
+    if len(final_samples) > 0:
         plot_qualitative_overlays(
-            torch.stack(qual_samples['rgb']),
-            torch.stack(qual_samples['true_masks']),
-            torch.stack(qual_samples['pred_masks']),
-            torch.stack(qual_samples['true_boxes']),
-            torch.stack(qual_samples['pred_boxes']),
-            torch.stack(qual_samples['true_labels']),
-            torch.stack(qual_samples['pred_labels']),
+            torch.stack([s['rgb'] for s in final_samples]),
+            torch.stack([s['true_masks'] for s in final_samples]),
+            torch.stack([s['pred_masks'] for s in final_samples]),
+            torch.stack([s['true_boxes'] for s in final_samples]),
+            torch.stack([s['pred_boxes'] for s in final_samples]),
+            torch.stack([s['true_labels'] for s in final_samples]),
+            torch.stack([s['pred_labels'] for s in final_samples]),
             dataset_name,
-            num_samples=len(qual_samples['rgb'])
+            num_samples=len(final_samples)
         )
 
-    # --- Compile Final Metrics ---
+    # Final metrics
     metrics = {}
     
     # Classification
@@ -318,7 +403,12 @@ def evaluate_dataset(model, loader, channels, dataset_name):
     return metrics
 
 def save_metrics_to_file(dataset_name, metrics):
-    """Appends the numerical metrics to a text file in the results directory."""
+    """
+    Appends the numerical metrics to a text file in the results directory
+    Args::
+        dataset_name: name of the dataset
+        metrics: performance metrics
+    """
     filepath = f"{RESULTS_DIR}/metrics.txt"
     
     with open(filepath, "a") as f:
@@ -332,49 +422,49 @@ def main(args):
     cudnn.benchmark = True
     print(f"Full Independent Evaluation on {DEVICE}")
     
-    # --- NEW: Clear previous metrics file ---
+    #Save to metrics file
     metrics_path = f"{RESULTS_DIR}/metrics.txt"
     with open(metrics_path, "w") as f:
         f.write("=== FINAL MODEL EVALUATION METRICS ===\n\n")
     
-    # 1. Setup Paths
+    # Setup paths
     current_file_path = Path(__file__).resolve()
     dataset_root = current_file_path.parent.parent.parent / "rgb_depth"
     
-    # 2. Load Model
+    # Model loading
     model = HandGestureModel(in_channels=args.channels, n_classes=10).to(DEVICE)
     weights_path = f"{WEIGHTS_DIR}/finetuned_model_{args.channels}ch.pth"
     print(f"Loading weights from: {weights_path}")
     model.load_state_dict(torch.load(weights_path, map_location=DEVICE))
 
-    # --- EVALUATE INTERNAL SPLITS ---
+    # Evaluation
     if dataset_root.exists():
         train_students, val_students, test_students = get_student_split(str(dataset_root))
         
         # Val Set
         val_dataset = HandGestureDataset(str(dataset_root), val_students, augment=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12, pin_memory=True)
-        val_metrics = evaluate_dataset(model, val_loader, args.channels, "val")
-        save_metrics_to_file("val", val_metrics) # <--- NEW
+        val_metrics = evaluate_dataset(model, val_loader, args.channels, "val", connected_components=args.connected_components)
+        save_metrics_to_file("val", val_metrics) 
         
         # Train Set
         train_dataset = HandGestureDataset(str(dataset_root), train_students, augment=False)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=12, pin_memory=True)
-        train_metrics = evaluate_dataset(model, train_loader, args.channels, "train")
-        save_metrics_to_file("train", train_metrics) # <--- NEW
+        train_metrics = evaluate_dataset(model, train_loader, args.channels, "train", connected_components=args.connected_components)
+        save_metrics_to_file("train", train_metrics) 
 
         # Internal Test Set
         test_dataset = HandGestureDataset(str(dataset_root), test_students, augment=False)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12, pin_memory=True)
-        test_internal_metrics = evaluate_dataset(model, test_loader, args.channels, "test_internal")
-        save_metrics_to_file("test_internal", test_internal_metrics) # <--- NEW
+        test_internal_metrics = evaluate_dataset(model, test_loader, args.channels, "test_internal", connected_components=args.connected_components)
+        save_metrics_to_file("test_internal", test_internal_metrics) 
 
-    # --- EVALUATE OFFICIAL TEST ---
+    # Evaluate on the official test
     if args.test_dir and os.path.exists(args.test_dir):
         test_dataset = OfficialTestDataset(root_dir=args.test_dir)
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=12, pin_memory=True)
-        test_official_metrics = evaluate_dataset(model, test_loader, args.channels, "test_official")
-        save_metrics_to_file("test_official", test_official_metrics) # <--- NEW
+        test_official_metrics = evaluate_dataset(model, test_loader, args.channels, "test_official", connected_components=args.connected_components)
+        save_metrics_to_file("test_official", test_official_metrics) 
     else:
         print("Skipping Official Test Set (Provide valid --test_dir)")
 
@@ -385,6 +475,7 @@ if __name__ == "__main__":
     parser.add_argument('--channels', type=int, default=4)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--test_dir', type=str, required=False, help="Path to the official test dataset directory")
+    parser.add_argument('--connected_components', type=bool, required=False, default=False, help="Perform connected comopnents post processing")
     args = parser.parse_args()
     
     main(args)
